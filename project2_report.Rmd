@@ -1,0 +1,275 @@
+---
+title: 'Project 2'
+author: "Samuel Brinkmann (s2623525)"
+output:
+  html_document:
+    number_sections: yes
+  pdf_document:
+    number_sections: yes
+header-includes:
+  - \newcommand{\bm}[1]{\boldsymbol{#1}}
+  - \newcommand{\mat}[1]{\begin{bmatrix}#1\end{bmatrix}}
+---
+
+```{r setup, include = FALSE}
+# Modify this setup code chunk to set options
+# or add extra packages etc if needed.
+# See the project instructions for more details
+# on what code to show, and where/how.
+
+# Set default code chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE
+)
+
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(kableExtra))
+theme_set(theme_bw())
+
+# To give the same random number sequence every time the document is knit:ed,
+# making it easier to discuss the specific numbers in the text:
+set.seed(12345L)
+```
+
+```{r code=readLines("code.R"), eval=TRUE, echo=FALSE, results='hide'}
+# Do not change this code chunk
+# Load function definitions
+source("code.R")
+```
+# Introduction
+
+In this report, we will extend the analysis of the 3D-printer use-case from the first report with leave-one-out cross validation and Monte Carlo method. For this, we will use the same 86 observation data frame from the first report. Furthermore, we will use the Monte Carlo method to estimate the number of people that were buried at the gravesite outside of the walls of Visby.
+
+# Part 1: 3D printer
+
+Let us start by loading the data. As a reminder, we know from the last report that the data contains 5 columns:
+
+- Index: an observation index
+
+- Date: printing dates
+
+- Material: the printing material, identified by its colour
+
+- CAD_Weight: the object weight (in grams) that the CAD software calculated
+
+- Actual_Weight: the actual weight of the object (in grams) after printing
+
+```{r data-loading, eval=TRUE, echo=TRUE}
+# Load dataframe filament1
+load(file='filament1.rda')
+```
+
+We will use the two linear models $A$ and $B$ for describing the relationship between CAD_Weight $x_i$ and Actual_Weight $y_i$ for observation $i$. Those models are defined in the following way:
+
+$$
+\begin{aligned}
+  \text{Model A: } y_i &\sim \text{Normal}[\beta_1+\beta_2 x_i, \exp(\beta_3+\beta_4 x_i)], \\
+  \text{Model B: } y_i &\sim \text{Normal}[\beta_1+\beta_2 x_i, \exp(\beta_3)+\exp(\beta_4) x_i^2)].
+\end{aligned}
+$$
+We will now train model $A$ and $B$ on the ``filament1`` data and then predict the actual weights of the ``filament1`` data with them. To evaluate the predictions, we will create mean, standard deviation, and the 95% prediction interval of our model distributions (for each observation). Furthermore, we will calculate the squared error and Dawid-Sebastiani scores in a second step.
+
+```{r, eval=TRUE, echo=TRUE}
+# Calculate 95% prediction intervals
+pred_A <- filament1_predict(filament1, filament1, "A")
+pred_B <- filament1_predict(filament1, filament1, "B")
+
+# Calculate squared error (SE) and Dawid-Sebastiani (DS) scores
+score_A <- scoring_func(pred_A, filament1)
+score_B <- scoring_func(pred_B, filament1)
+```
+
+```{r, eval=TRUE, echo=FALSE}
+# Print scores A
+create_table(
+  head(score_A),
+  caption = "table 1: 95% prediction intervals and evaluation scores for models A",
+  index_col = T
+)
+```
+
+We can see that model $A$ seems to fit the data pretty well except in the first and third row. But let us visualize the results of both models to have a better look.
+
+```{r, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 1: prediction intervals of model A and B with estimated actual weights (red/blue line), true actual weights (black points), and the prediction interval (grey area)."}
+score_A$model <- 'A'
+score_B$model <- 'B'
+plot_data <- rbind(score_A, score_B)
+
+ggplot(plot_data, aes(x=CAD_Weight, group=model, col=model)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = 'grey', alpha = 0.5) +
+  geom_line(aes(y = mean), linewidth = 1) +
+  geom_point(aes(y = Actual_Weight), color = "black", shape = 16) +
+  labs(x = 'CAD weight (in grams)', y = 'Actual Weight (in grams)') +
+  theme_minimal()
+```
+
+Both models seem to fit the data well with $B$ having a bit tighter prediction intervals. To know which models performs better, we can calculate the mean of the SE and SD score.
+
+```{r, eval=TRUE, echo=FALSE}
+scores_data <- data.frame(Model = c("A", "B"),
+                          SE = c(mean(score_A$se), mean(score_B$se)),
+                          SD = c(mean(score_A$sd), mean(score_B$sd)))
+
+# Print evaluation scores
+create_table(
+  scores_data,
+  caption = "table 2: SE and SD score for model A and B",
+  index_col = T
+)
+```
+
+We can see that our feeling with $B$ having tighter prediction intervals was correct because the SD score of model $B$ is lower, although model $A$ has the lower SE score. In conclusion, both models have very similar SE and SD scores. But which model is "better"? On one hand, model $A$ has a slightly lower SE score than $B$, suggesting that $A$ is more reliable across different data sets or subsamples. On the other hand, model $B$'s lower SD score means it might make more accurate predictions on average or is better calibrated to the true outcome probabilities. So, which model is "better" depends on the priorities of the client.
+
+We also have to keep in mind that we trained and evaluated on the same data. So, it could be that one of the models overfitted and does not perform that well on unseen data. Therefore, we will do a leave-one-out cross validation next and compare the results with the ones in table 2.
+
+```{r, eval=TRUE, echo=TRUE}
+# Calculate leave-one-out cross validation scores for model A and B
+l1o_score_A <- leave1out(filament1, "A")
+l1o_score_B <- leave1out(filament1, "B")
+```
+
+```{r, eval=TRUE, echo=FALSE}
+l1o_scores_data <- data.frame(Model = c("A", "B"),
+                          SE = c(mean(l1o_score_A$se), mean(l1o_score_B$se)),
+                          SD = c(mean(l1o_score_A$sd), mean(l1o_score_B$sd)))
+
+# Print evaluation scores
+create_table(
+  l1o_scores_data,
+  caption = "table 3: leave-one-out SE and SD score for model A and B",
+  index_col = T
+)
+```
+
+In table 3, we can see that the SE scores are now nearly the same (difference of 0.003) and the gap between the SD scores is greater than in table 2. This implies that model $B$ should be preferred because it seems to predict better on unseen data than model $A$. 
+
+As a last test, we can calculate the p-value to test the exchangeability of the SE scores of model A and B under the hypothesis that model $B$ is better than model $A$. We will do this by using a Monte Carlo estimate of the p-value with 10000 simulations. Our test static $T$ for the hypothesis is
+
+$$
+T(score_A, score_B) = \frac{1}{N}\sum_{i=1}^{N} score_{A, i} - score_{B, i}
+$$
+where $N$ is the number of observations (here: 86).
+
+Our expectation would be that we get a high p-value because non of the models is significantly better than the other.
+
+```{r, eval=TRUE, echo=TRUE}
+# Calculate Monte Carlo estimate of the p-value
+# Hypothesis: Model B is better than model A
+pvalue_estimator(score_A$se, score_B$se)
+```
+
+We can see that our expectation was correct. So, we cannot say that model $B$ is better in the sense of the SE score than model $A$. For the other way around, we would expect a slightly lower p-value, but still significantly greater than 0.05.
+
+```{r, eval=TRUE, echo=TRUE}
+# Calculate Monte Carlo estimate of the p-value
+# Hypothesis: Model A is better than model B
+pvalue_estimator(score_B$se, score_A$se)
+```
+
+As expected also model $A$ is not significantly better than model $B$. But we can now test if model $B$ is better than model $A$ in the sense of the DS score like we interpreted the scores in table 3.
+
+```{r, eval=TRUE, echo=TRUE}
+# Calculate Monte Carlo estimate of the p-value
+# Hypothesis: Model B is better than model A (using DS score)
+pvalue_estimator(score_A$ds, score_B$ds)
+```
+
+We can see that the p-value is very high compared to 0.05, although it is lower than in the other two tests. In conclusion, we cannot say that one of the models performs significantly better than the other in the sense of the SE or SD score. One could argue with table 3 that one should tend towards model $B$, but in the end the models hardly differ. For future analysis, one could try out to use a more complex test statistic for the Monte Carlo estimate of the p-value or use a metric other than SE and SD score.
+
+# Part 2: Archaeology in the Baltic sea
+
+In the second part of this report, we will try to estimate the number of people that were buried at the gravesite outside of the walls of Visby. We know from archaeological excavations that there are at least 256 people because they found 493 femurs (256 left and 237 right). For our model, we will assume that the number of left and right  femur are independent observations $(y_1, y_2)$ from a Bin($N, \phi$) distribution. Here, $N$ is the total number of people buried in the gravesite and $phi$ is the probability of finding a femur. Both of the parameter are unknown, so we will try to estimate them using the Monte Carlo method.
+
+Before the excavation took place, the archaeologist assumed that around 1000 individuals were buried, and that they would find around half of the femurs. To encode this into our Bayesian analysis, we will sample $N \sim Geom(\xi)$ with $\xi = \frac{1}{1000+1}$ and $\phi \sim Beta(a, b)$ with $a = b = \frac{1}{2}$. Then $$\mathbb{E}[N] = \frac{1 - \xi}{\xi} = \frac{\frac{1000}{10001}}{\frac{1}{10001}} = 1000 \quad\text{ and }\quad \mathbb{E}[\phi] = \frac{a}{a + b} = \frac{\frac{1}{2}}{1} = \frac{1}{2}.$$
+
+We will repeat the Monte Carlo simulation $K = 10000$ times for the observation $(y_1, y_2) = (256, 237)$ and calculate the following mean values
+
+
+\begin{aligned}
+\widehat{p}_y(y) &= \frac{1}{K} \sum_{i=1}^K p(y | N^{[i]}, \phi^{[i]}), \\
+
+\widehat{\mathbb{E}}[N | y] &= \frac{1}{K \cdot \hat{p}_y(y)} \sum_{i=1}^K N^{[i]} \cdot p(y | N^{[i]}, \phi^{[i]}), \\
+
+\widehat{\mathbb{E}}[\phi | y] &= \frac{1}{K \cdot \hat{p}_y(y)} \sum_{i=1}^K \phi^{[i]} \cdot p(y | N^{[i]}, \phi^{[i]}),
+\end{aligned}
+
+where $p(y|N, \phi) = \binom{N}{y} \phi^y(1 - \phi)^{N−y}$ for a single observation and the log-likelihood function for the combined observation $(y_1, y_2)$ is given by
+
+$$
+\begin{aligned}
+  \log(p(y_1, y_2|N, \phi)) = &-\log\Gamma(y_1 + 1) -\log\Gamma(y_2 + 1) \\
+  &-\log\Gamma(N - y_1 + 1) -\log\Gamma(N - y_2 + 1) + 2\log\Gamma(N +    1) \\
+  &+ (y_1 + y_2)\log(\phi) + (2N + y_1 + y_2) \log(1 -\phi).
+\end{aligned}
+$$
+
+Let us now calculate those values.
+
+```{r, eval=TRUE, echo=TRUE}
+# Calculate Monte Carlo estimate for the femurs
+femur_estimate <- estimate(y=c(256,237), xi=1/1001, a=0.5, b=0.5, K=10000)
+```
+
+```{r, eval=TRUE, echo=FALSE}
+# Print table with results
+create_table(
+  data.frame(femur_estimate),
+  caption="tabel 4: Monte Carlo estimate for the femurs",
+  digits = 6
+)
+```
+
+In table 4, we can see that our Monte Carlo estimate for $N$ and $\phi$ are $N \approx 890$ and $\phi \approx 0.4$. So, our prediction is that round about 890 people are buried on the gravesite and the probability of finding a femur is 40%. This would mean that the archaeologists found 356 different people. This also means that they found less people than they assumed before the excavation took place (assumed 1000 people with 0.5 chance of finding a femur, so 500 people). The ``py`` value tells us that the estimated probability to find exactly this combination of left and right femurs is $8\cdot 10^{-6}$ which by itself cannot be interpreted. So let us look at the probabilities in the neighborhood of $y = (256, 237)$.
+
+```{r, eval=TRUE, echo=TRUE}
+# Define the range of the neighborhood
+range <- 20
+center_value <- c(256, 237)
+
+# Generate all combinations of values within the range of each center value
+values <- expand.grid(lapply(center_value, function(x) seq(x - range, x + range, by=2)))
+
+# Convert the result to a matrix
+result_matrix <- as.matrix(values)
+
+# Calculate Monte Carlo estimate for the probabilities
+py_estimate <- estimate(y=result_matrix, xi=1/1001, a=0.5, b=0.5, K=10000)$py
+```
+
+```{r, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 2: Probabilities of points in the neighborhood of (256, 237) (black point) on a logarithmic scale."}
+# Create data frame for plotting
+result_df <- as.data.frame(result_matrix)
+names(result_df) <- c("y1", "y2")
+result_df$prob <- py_estimate
+
+# Create plot
+ggplot(result_df, aes(x = y1, y = y2, fill = prob)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = c("blue", "red"), name = "Probability", trans = "log") +
+  geom_point(aes(x=256, y=237), size=3)
+```
+
+We can see that our observation has approximately an average probability in its neighborhood of range 20. However, there are observations that are much more likely according to our model, e.g. $(240, 240)$ or $(254, 254)$. Note that we are using a logarithmic scale in figure 2, so these differences are greater than the colors might suggest. This interpretation is based on figure 2, but we can also calculate the mean and median of the neighborhood to see if our interpretation is correct. Before proceeding, it is worth to highlight that our model assigns the highest probabilities to observations where $y_1$ closely resembles $y_2$. This consistency is expected given that $y_1$ and $y_2$ are assumed to originate from the same distribution. This expectation aligns logically with the fact that individuals typically possess two femurs, implying a tendency towards a similar distribution for both variables when they are independent.
+
+```{r, eval=TRUE, echo=TRUE}
+# Calculate the mean of the probabilities
+mean_neighborhood <- mean(py_estimate)
+
+# Calculate the median of the probabilities
+median_neighborhood <- median(py_estimate)
+```
+
+```{r, eval=TRUE, echo=FALSE}
+create_table(data.frame(mean=mean_neighborhood,median=median_neighborhood), caption="table 5: Mean and median of the neighborhood", digits = 6)
+```
+We can see that the median is the same and the mean slightly greater than our probability of 8e-6 for $y=(256,237)$. This is consistent with our interpretation of figure 2.
+
+In conclusion, the results of our estimation show that the archaeologists found less femurs than expected and that the 237 right and 256 left femurs belong to 356 people.
+
+# Code appendix
+
+```{r code=readLines("code.R"), eval=FALSE, echo=TRUE}
+# Do not change this code chunk
+```

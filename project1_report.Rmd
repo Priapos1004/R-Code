@@ -1,0 +1,401 @@
+---
+title: 'StatComp Project 1:  3D printer materials estimation'
+author: "Samuel Brinkmann (s2623525)"
+output:
+  html_document: 
+    number_sections: true
+    fig_caption: true
+  pdf_document:
+    number_sections: yes
+header-includes:
+  - \newcommand{\bm}[1]{\boldsymbol{#1}}
+  - \newcommand{\mat}[1]{\begin{bmatrix}#1\end{bmatrix}}
+---
+
+```{r setup, include = FALSE}
+# Modify this setup code chunk to set options
+# or add extra packages etc if needed.
+# See the project instructions for more details
+# on what code to show, and where/how.
+
+# Set default code chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE
+)
+
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(spatstat))
+theme_set(theme_bw())
+
+# To give the same random number sequence every time the document is knit:ed,
+# making it easier to discuss the specific numbers in the text:
+set.seed(12345L)
+```
+
+```{r code=readLines("code.R"), eval=TRUE, echo=FALSE, include = FALSE}
+# Do not change this code chunk
+# Load function definitions
+source("code.R")
+```
+
+# Introduction
+
+In this report, we will look into a 3D-printer use-case. The 3D printer uses rolls of filament to build step by step objects. The objects are first designed in a CAD program (Computer Aided Design) that also estimates how much material will be required to print the object. The problem is that there is an error in the material estimation of the CAD program. We have a dataframe with 86 observations of the CAD weights, actual weights, and some other information. Our goal now is to first investigate the data and later estimate the actual weight of the printed objects based on its CAD weight. For this, we will use first a classical estimator approach and then a Bayesian estimator using importance sampling.
+
+# Data exploration
+Let us start by looking into the data. We know from the data description that we have 5 columns:
+
+- Index: an observation index
+
+- Date: printing dates
+
+- Material: the printing material, identified by its colour
+
+- CAD_Weight: the object weight (in grams) that the CAD software calculated
+
+- Actual_Weight: the actual weight of the object (in grams) after printing
+
+Before we can investigate the data, we have to load it and calculate the cumulative average of the weight error for one of the later plots.
+
+```{r data-loading, eval=TRUE, echo=TRUE}
+# Load dataframe filament1
+load(file='filament1.rda')
+
+# Calculate cumulative average of the weight error
+filament1_weight_error <- filament1 %>%
+  arrange(CAD_Weight) %>%
+  mutate(Cumulative_Average_Error = cummean(Actual_Weight - CAD_Weight))
+```
+
+Now let us start plotting. Firstly, we can plot the weight as boxplots by material.
+
+```{r material-bar-plot, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 1: boxplots of the average CAD weights vs average actual weights by material"}
+# reshaping data for material plot
+filament1_material_plot <- filament1 %>%
+  pivot_longer(cols = ends_with("_Weight"),
+               names_to = "Weight_Type",
+               values_to = "Weight")
+
+# Box plot of weights by material with outliers removed
+ggplot(filament1_material_plot, aes(x = Material, y = Weight, fill = Weight_Type)) +
+  geom_boxplot(
+    position = position_dodge(0.8),  # Adjust the dodge width if necessary
+    outlier.shape = NA  # This removes the outliers
+  ) +
+  scale_fill_manual(values = c("CAD_Weight" = "#FF9999", "Actual_Weight" = "#9999FF")) +
+  theme_minimal() +
+  labs(y = "Weight (in grams)", x = "Material", fill = "Weight Type")
+```
+
+We can see that the actual weight is for every material in average higher than the CAD weight. The difference between the averages differ a little bit from material to material; however, there is no strong outlier material. Contrary, the weight range of objects printed of a material differs a lot. We can see that the weight variety of 'red' objects is larger than for the other materials. Depending on our further results, it may be useful to look at individual materials separately. For example, if the approach in this report of estimating the actual weight only on the CAD weight will return bad results, one could improve these by using a model depending on CAD weights and material. For the moment, until we are convinced otherwise, we assume that the error in CAD weights is similar for all materials.
+
+Secondly, we can look in more detail into the connection between the CAD and actual weights.
+
+```{r weights-line-plot, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 2: line plot of CAD and actual weight"}
+# line plot of CAD and actual weights
+ggplot(filament1, aes(x = CAD_Weight, y = Actual_Weight)) +
+  geom_line() +
+  geom_point(colour="blue") +
+  theme_minimal() +
+  labs(y = "actual weight (in grams)", x = "CAD weight (in grams)")
+```
+
+We can see that most of the weights are below 50g with a high density around 40g. So, we have to keep in mind that heavier objects are underrepresented and therefore, our estimator may not perform as well on them as on ones around 50g and below.
+
+Lastly, we can take a closer look into the error of the CAD weights (Actual_Weight - CAD_Weight).
+
+```{r error-weights-scatter-plot, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 3: scatter plot of CAD weights and weight error with cumulative average (red)"}
+# line plot of CAD and actual weights
+ggplot(filament1_weight_error, aes(x = CAD_Weight, y = Actual_Weight - CAD_Weight)) +
+  geom_point(colour = "blue") +
+  geom_line(aes(y = Cumulative_Average_Error), colour = "red", linewidth = 1) +
+  theme_minimal() +
+  labs(y = "weight error (in grams)", x = "CAD weight (in grams)")
+```
+
+We can see that the weight error is proportional to the CAD weight and the cumulative average is increasing with the CAD weight. We will use this insight for our model $B$ (in the section 'classical estimation') to simplify it. Furthermore, we can see that the error seems to go to 0 for CAD weight going to 0. This means that we probably have no additive, but only a relative error (we will also use this for our model $B$).
+
+# Classical estimation
+
+We will now use two linear models $A$ and $B$ for describing the relationship between CAD_Weight $x_i$ and Actual_Weight $y_i$ for observation $i$. Those models are defined in the following way:
+
+$$
+\begin{aligned}
+  \text{Model A: } y_i &\sim \text{Normal}[\beta_1+\beta_2 x_i, \exp(\beta_3+\beta_4 x_i)], \\
+  \text{Model B: } y_i &\sim \text{Normal}[\beta_1+\beta_2 x_i, \exp(\beta_3)+\exp(\beta_4) x_i^2)].
+\end{aligned}
+$$
+
+Model $A$ is from a mathematical convenient perspective and model $B$ uses physical assumptions:
+
+1) random fluctuation are a relative error instead of additive; and
+
+2) the error in the CAD weight calculation is proportional to the weight itself.
+
+If the first assumption of model $B$ holds, then we should find $\exp(\beta_3) \approx 0$. The second assumption should improve the variance of model $B$ compared to model $A$.
+
+We can now calculate the confidence intervals for the four parameters $(\beta_1, \beta_2, \beta_3, \beta_4)$ and the two models, and compare the results to evaluate both models.
+
+```{r classical-estimator-calculations, eval=TRUE, echo=TRUE}
+# Calculate mode and hessian for model A and B
+fit_A = filament1_estimate(filament1, "A")
+fit_B = filament1_estimate(filament1, "B")
+
+# Calculate confidence intervals based on the mode and hessian
+table_A <- get_CI_from_fit(fit_A)
+table_B <- get_CI_from_fit(fit_B)
+
+# Combine the tables for Model A and Model B
+combined_table <- rbind("Model A" = table_A, "Model B" = table_B)
+```
+
+```{r confidence-intervals-model-A-and-B, eval=TRUE, echo=FALSE}
+# Use kable from knitr to create a basic table
+kable_output <- knitr::kable(combined_table, caption = "table 1: 90% confidence intervals for models A and B", booktabs = TRUE, digits = 4)
+
+# Use kableExtra to style the table
+styled_kable_output <- kable_output %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE, position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4d4d4d") %>% 
+  column_spec(1, bold = TRUE) %>% 
+  column_spec(2:5, width = "2.5cm")
+
+# Print the styled table
+styled_kable_output
+```
+
+We can see in the confidence interval results that $\beta_1$ and $\beta_2$ have very similar estimates for both models. This makes sense because both models use $\beta_1$ and $\beta_2$ for their mean in the same way. It is more interesting now to look at $\beta_3$ and $\beta_4$ because here we used different approaches for both models. The physical hypotheses were that random fluctuations are a relative error and not additive which one can also see in $\beta_3$ of model $B$. The estimate is $\approx -13$, so $\exp(\beta_3) \approx 0$ in the model, and we have a very large (compared to the other intervals) width. This means that $\beta_3$ has no real significance for model $B$ and was assigned randomly. To simplify the model, we could remove it and just use $\exp(\beta_4) x_i^2$ for the variance of model $B$. The second physical hypothesis was that the calculation error is proportional to the weight itself. We can check if this assumption improved the variance with comparing the variance of model $A$ and $B$. The estimate of $\beta_4$ from model $B$ is around $\approx -6.6$, so also very small, but contrary to $\beta_3$, the width is quite small, so the parameter was not assigned randomly. This means for the variance of model $B$ that $\exp(\beta_3) + exp(\beta_4)x_i^2 \approx exp(-6.6)x_i^2 = \exp(-6.6 + 2 \log(x_i))$. For model $A$, we get a variance of $\exp(\beta_3 + \beta_4 x_i) \approx \exp(-2 + 0.06 x_i)$. We can now plot those variances and compare them.
+
+```{r variance-line-plot-data, eval=TRUE, echo=TRUE}
+# Create a sequence of x values
+x_values <- seq(0, 85, by = 0.1)
+
+# Define the functions
+f_x <- exp(-6.6 + 2 * log(x_values))
+g_x <- exp(-2 + 0.06 * x_values)
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  x = x_values,
+  f_x = f_x,
+  g_x = g_x
+)
+```
+
+```{r variance-line-plot, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 4: line plot of variance"}
+# Filter out any NaN or Inf values that might occur due to log(0) or similar operations
+plot_data <- plot_data[!is.infinite(plot_data$f_x) & !is.nan(plot_data$f_x) & plot_data$x > 0, ]
+
+# Convert the data frame to long format for ggplot2
+plot_data_reshaped <- pivot_longer(plot_data, cols = c("f_x", "g_x"), names_to = "function_name", values_to = "value")
+
+# Plot the functions using ggplot2 with a legend
+ggplot(plot_data_reshaped, aes(x = x, y = value, color = function_name)) +
+  geom_line() +  # Removes direct color assignment, uses mapping instead
+  scale_color_manual(values = c("f_x" = "blue", "g_x" = "green"), labels = c("f(x) = e^(-6.6 + 2ln(x))", "g(x) = e^(-2 + 0.06x)")) +
+  labs(x = "x_i", y = "variance", color = "function") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+We can see that in the interval [20, 60] model $A$ has the better variance where most of the CAD weight points lie in our data. However, above 60 the variance of model $A$ increases rapidly. We have data points in `filament1` until round about 80. Therefore, it makes sense to use model $B$ because stability is to prefer over slightly better errors. Especially, because the amount of data points we have above 60 is still significant enough. In conclusion, one can debate now if model $B$ has the better variance, but for me, stability is often to prefer, so I would say that the second assumption improved the variance.
+
+To put it in a nutshell, we saw that $\beta_1$ and $\beta_2$ are very similar for both models. So, their expected values will be similar. Furthermore, we found out that the variance of model $B$ can be described in a simpler way with removing $\exp(\beta_3)$ and it is stabler for heavier CAD weights than the variance of model $A$. Thus, even so one can argue which model has the better variance for the use-case, model $B$ should be chosen according to Occam's razor principle.
+
+# Bayesian estimation
+
+We will now try a bayesian approach for describing the relation between the actual weights $y_i$ and the CAD weights $x_i$ for observation $i$. We will use the following model
+
+$$
+y_i \sim \text{Normal}[\beta_1+\beta_2 x_i, \beta_3+\beta_4 x_i^2],
+$$
+
+and to ensure the positivity of the variance, we introduce $\bm{\theta} = [\theta_1, \theta_2, \theta_3, \theta_4] = [\beta_1, \beta_2, \log(\beta_3), \log(\beta_4)]$ with the independent prior distributions
+
+$$
+\begin{aligned}
+  \theta_1 &\sim \text{Normal}[0, \gamma_1], \\
+  \theta_2 &\sim \text{Normal}[1, \gamma_2], \\
+  \theta_3 &\sim \text{LogExp}[\gamma_3], \\
+  \theta_4 &\sim \text{LogExp}[\gamma_4],
+\end{aligned}
+$$
+
+where LogExp($a$) denotes the logarithm of an exponentially distributed random variable with rate parameter $a$. The $\bm{\gamma} = [\gamma_1, \gamma_2, \gamma_3, \gamma_4]$ values are positive parameters. This model corresponds to our model $B$ from the classical estimator approach:
+
+$$
+y_i \sim \text{Normal}[\theta_1+\theta_2 x_i, \exp(\theta_3)+\exp(\theta_4) x_i^2].
+$$
+
+We will start by calculating the mode $\bm{\mu}$ and the inverse of the negated Hessian $\mathbf{S}$ of the log-posterior-density. We will use the initial $\bm{\theta}$ values $[0,0,0,0]$ for our optimization and set the parameters $\bm{\gamma} = [1,1,1,1]$.
+
+```{r posterior-mode-calculations, eval=TRUE, echo=TRUE}
+# initial values for optimization
+theta_start <- rep(0, 4)
+
+# values for parameters
+params <- rep(1, 4)
+
+# Calculate the mode mu and inverse of the
+# negated Hessian S of the log-posterior-density
+posterior_result <- posterior_mode(
+  theta_start=theta_start,
+  x=filament1$CAD_Weight,
+  y=filament1$Actual_Weight,
+  params=params
+)
+```
+
+With the `posterior_result`, we can do a multivariate normal approximation Normal$[\bm{\mu}, \mathbf{S}]$ where $\bm{\mu}$ is its mean and $\mathbf{S}$ is its covariance matrix. This allows us to use importance sampling, with $N = 10000$ as the number of samples. The result is a dataframe with the beta values for each sample and the logarithmic weight.
+
+```{r importance-sampling-calculations, eval=TRUE, echo=TRUE}
+# number of samples for importance sampling
+N <- 10000
+
+# Use mu as mean and S as covariance matrix for 
+# multivariate normal approximation in importance sampling
+importance_results <- do_importance(
+  N=N,
+  mu=posterior_result$mode,
+  S=posterior_result$S,
+  x=filament1$CAD_Weight,
+  y=filament1$Actual_Weight,
+  params=params
+)
+```
+
+```{r importance-sampling-results, eval=TRUE, echo=FALSE}
+# displaying first 6 entries of result
+kable_output <- knitr::kable(head(importance_results), caption = "table 2: first 6 entries of importance sampling result", booktabs = TRUE, digits = 8)
+
+styled_kable_output <- kable_output %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE, position = "center") %>%
+  row_spec(0, bold = TRUE, align="center", color = "white", background = "#4d4d4d") %>% 
+  column_spec(2:5, width = "2.5cm")
+
+# Print the styled table
+styled_kable_output
+```
+
+$\textbf{Remark: }$ We can see that for the first 6 rows, the estimated values of $\beta_1$ and $\beta_2$ are very similar to the results in table 1. This makes sense because we already noticed that our model for $\bm{\theta}$ is the same as our model $B$ from before, with $\theta_1 = \beta_1$ and $\theta_2 = \beta_2$, and the mean of the two models should be the same. The values for $\beta_3$ and $\beta_4$ differ because they have a logarithmic relation to $\theta_3$ and $\theta_4$; so, we can not directly compare them.
+
+To visualize the importance sampling results and look at all 10000 rows and not just the first 6, we can plot the weighted cumulative distribution functions for the different betas.
+
+```{r cdf-plot, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 5: line plot of weighted CDFs for each parameter"}
+# Reshape data for plotting
+importance_results_reshaped <- pivot_longer(importance_results, cols = starts_with("beta"), 
+                                       names_to = "parameter", values_to = "value")
+
+# Plot weighted CDFs for each parameter
+ggplot(importance_results_reshaped, aes(x = value, colour = parameter, weights = exp(log_weights))) +
+  stat_ewcdf(na.rm = TRUE) +
+  facet_wrap(vars(parameter), ncol = 1) +
+  theme(legend.position = "none") +
+  scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6), limits = c(0, 6))
+```
+
+We can see that especially $\beta_2$ and $\beta_4$ have most of their values at one point and therefore, an increase from 0 to 1 that is nearly vertical. This means that the confidence interval of $\beta_2$ and $\beta_4$ will be very small. The other two betas have both smoother increases, but still focused in a small area. This means that our model has a high overall confidence for the found parameters of the importance sampling. Especially, the confidence for $\beta_2$ and $\beta_4$ is good because those parameters are the coefficients of $x_i$ in the mean and variance and therefore, have a big impact.
+
+Next, let us look at the confidence intervals.
+
+```{r confidence-intervals-model-importance-sampling, eval=TRUE, echo=TRUE}
+# Calculate the credible intervals for each parameter
+CIs <- lapply(1:4, function(i) {
+  make_CI(importance_results[[paste0("beta", i)]], exp(importance_results$log_weights), prob = 0.9)
+})
+names(CIs) <- paste0("beta", 1:4)
+```
+
+```{r confidence-intervals-table, eval=TRUE, echo=FALSE}
+combined_CIs <- bind_rows(CIs, .id = NULL)
+rownames(combined_CIs) <- c("Beta1", "Beta2", "Beta3", "Beta4")
+
+kable_output <- knitr::kable(combined_CIs, caption = "table 3: 90% confidence intervals for I.S. model", booktabs = TRUE, digits = 4)
+
+# Use kableExtra to style the table
+styled_kable_output <- kable_output %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE, position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4d4d4d") %>% 
+  column_spec(1, bold = TRUE) %>% 
+  column_spec(2:4, width = "2.5cm")
+
+# Print the styled table
+styled_kable_output
+```
+
+We can see that our interpretation of figure 5 matches the confidence interval sizes of table 3, i.e. $\beta_2$ and $\beta_4$ have a very small interval and the other two betas have slightly wider but still small intervalls. The overall confidence of the bayesian model with importance sampling is better than the confidence values we got with the classical estimator.
+
+Lastly, we can now plot the prediction intervals based on point estimates of the parameters to visualize how accurate our model is. For this, we can calculate the weighted means of the betas to get our point estimates and use a credible interval of 90%.
+
+```{r prediction-intervals, eval=TRUE, echo=TRUE}
+# Calculate point estimates based on the weighted average
+weights <- exp(importance_results$log_weights)
+point_estimates <- apply(importance_results, 2, weighted.mean, w=weights, na.rm = TRUE)
+
+# Calculate y predictions and their upper/lower bound for 90% confidence
+alpha <- 0.9
+z_score <- qnorm((1+alpha)/2)
+
+y_predictions <- point_estimates["beta1"] + point_estimates["beta2"] * filament1$CAD_Weight
+y_std <- sqrt(point_estimates["beta3"] + point_estimates["beta4"] * filament1$CAD_Weight**2)
+y_predictions_upper <- y_predictions + z_score * y_std
+y_predictions_lower <- y_predictions - z_score * y_std
+```
+
+```{r estimated-parameters, eval=TRUE, echo=FALSE}
+point_estimates_df <- data.frame(point_estimates) %>%
+  t() %>%
+  as.data.frame()
+# Removing the "log_weight" column
+point_estimates_df$log_weights <- NULL
+
+kable_output <- knitr::kable(point_estimates_df, caption = "table 4: weighted average of I.S. parameter results", booktabs = TRUE, digits = 4)
+
+# Use kableExtra to style the table
+styled_kable_output <- kable_output %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE, position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4d4d4d") %>% 
+  column_spec(1, bold = TRUE) %>% 
+  column_spec(1:5, width = "2.5cm")
+
+# Print the styled table
+styled_kable_output
+```
+
+Now we can plot the predictions with their confidence intervals.
+
+```{r prediction-intervals-plot, eval=TRUE, echo=FALSE, fig.align='center', fig.cap="figure 6: prediction intervals based on point estimates of the parameters with estimated actual weights (red line), true actual weights (blue points), and the prediction interval (grey area)."}
+# Combine predictions and actual values into one dataframe for plotting
+plot_data <- data.frame(
+  CAD_Weight = filament1$CAD_Weight,
+  Actual_Weight = filament1$Actual_Weight,
+  y_predictions = y_predictions,
+  y_predictions_upper = y_predictions_upper,
+  y_predictions_lower = y_predictions_lower
+)
+
+# Plot using ggplot2
+ggplot(plot_data, aes(x = CAD_Weight)) +
+  geom_ribbon(aes(ymin = y_predictions_lower, ymax = y_predictions_upper), fill = 'grey', alpha = 0.5) +
+  geom_line(aes(y = y_predictions), color = "#FF9999", linewidth = 1) +
+  geom_point(aes(y = Actual_Weight), color = "blue", shape = 16) +
+  labs(x = 'CAD weight (in grams)', y = 'Actual Weight (in grams)') +
+  theme_minimal()
+```
+
+We can see that our model estimates the actual weights very good and also the confidence interval seems tight but not too tight. 
+
+All in all, the bayesian estimator with importance sampling found the four beta parameters with a high confidence and the estimated actual weights based on the CAD weights are very accurate. This means we solved the problem of the 3D-printer use-case. We could now try to reduce our error further with using a model that estimates based on CAD weights and material because we already saw in the data exploration that some materials are only used for objects in a small weight range. This could be useful if we have for every material a certain amount of data points and if the materials do not change often. Otherwise, it would be better to stick with a model only based on the CAD weights and maybe try to improve the importance sampling, use a different technique, or use more data points for parameter optimization.
+
+# Code appendix
+
+```{r code=readLines("code.R"), eval=FALSE, echo=TRUE}
+# Do not change this code chunk
+```
